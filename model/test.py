@@ -1,0 +1,197 @@
+import os
+import pickle
+
+import scipy
+import torch
+import torch.nn.functional as F
+import numpy as np
+
+from model.model import AutoEncoder
+import shutil
+from pathlib import Path
+import importlib
+
+from hrtfdata.transforms.hrirs import SphericalHarmonicsTransform
+
+import matplotlib.pyplot as plt
+
+def spectral_distortion_inner(input_spectrum, target_spectrum):
+    numerator = target_spectrum
+    denominator = input_spectrum
+    return torch.mean((20 * np.log10(numerator / denominator)) ** 2)
+
+def plot_tf(ir_id, ori_hrtf, recon_hrtf):
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+
+        ax1.plot(ori_hrtf[ir_id])
+        ax1.set_title(f'original (ID: {ir_id})')
+        ax2.plot(recon_hrtf[ir_id])
+        ax2.set_title(f'recon (ID {ir_id})')
+
+        # plt.show()
+        plt.savefig(f"tf_{ir_id}.png")
+        plt.close()
+
+def test(config, val_prefetcher):
+    # load the dataset to get the row, column angles info
+    data_dir = config.raw_hrtf_dir / config.dataset
+    imp = importlib.import_module('hrtfdata.full')
+    load_function = getattr(imp, config.dataset)
+    domain = config.domain
+    ds = load_function(data_dir, feature_spec={'hrirs': {'samplerate': config.hrir_samplerate,
+                                                         'side': 'left', 'domain': domain}}, subject_ids='first')
+    num_row_angles = len(ds.row_angles)
+    num_col_angles = len(ds.column_angles)
+    num_radii = len(ds.radii)
+
+    max_degree = config.max_degree
+    upscale_factor = config.upscale_factor
+    degree = max(1, int(np.sqrt(num_row_angles*num_col_angles*num_radii/upscale_factor) - 1)) 
+
+    ngpu = config.ngpu
+    recon_dir = config.valid_recon_path + f'/{upscale_factor}'
+    recon_mag_dir = recon_dir + '/mag'
+    recon_db_dir = recon_dir + '/db'
+    shutil.rmtree(Path(recon_mag_dir), ignore_errors=True)
+    Path(recon_mag_dir).mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(Path(recon_db_dir), ignore_errors=True)
+    Path(recon_db_dir).mkdir(parents=True, exist_ok=True)
+    nbins = config.nbins_hrtf * 2
+
+    device = torch.device(config.device_name if (
+            torch.cuda.is_available() and ngpu > 0) else "cpu")
+    model = AutoEncoder(nbins=nbins, in_degree=degree, latent_dim=config.latent_dim, base_channels=256, out_degree=max_degree).to(device)
+    print("Build VAE model successfully.")
+    # Load vae model weights (always uses the CPU due to HPC having long wait times)
+    model.load_state_dict(torch.load(f"{config.model_path}/{upscale_factor}/Gen.pt", map_location=torch.device('cpu')))
+    print(f"Load VAE model weights `{os.path.abspath(config.model_path)}`/{upscale_factor} successfully.")
+
+    param_size = 0
+    for param in model.parameters():
+        param_size += param.nelement() * param.element_size()
+    buffer_size = 0
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+
+    size_param_mb = param_size / 1024 ** 2
+    size_buffer_mb = buffer_size / 1024 ** 2
+    size_all_mb = (param_size + buffer_size) / 1024 ** 2
+    print('param size: {:.3f}MB'.format(size_param_mb))
+    print('buffer size: {:.3f}MB'.format(size_buffer_mb))
+    print('model size: {:.3f}MB'.format(size_all_mb))
+
+    # Start the verification mode of the model.
+    model.eval()
+
+    # Initialize the data loader and load the first batch of data
+    val_prefetcher.reset()
+    batch_data = val_prefetcher.next()
+
+    if config.transform_flag:
+        mean_std_dir = config.mean_std_coef_dir
+        mean_std_full = mean_std_dir + "/mean_std_full.pickle"
+        with open(mean_std_full, "rb") as f:
+            mean, std = pickle.load(f)
+        mean = mean.float().to(device)
+        std = std.float().to(device)
+
+    margin = 1.8670232e-08
+
+    plot_flag = True
+    count = 0
+    avg_lsd = []
+    while batch_data is not None:
+        print("count: ", count+1)
+        count += 1
+        # Transfer in-memory data to CUDA devices to speed up validation 
+        lr_coefficient = batch_data["lr_coefficient"].to(device=device, memory_format=torch.contiguous_format,
+                                                         non_blocking=True, dtype=torch.float)
+
+        hrtf = batch_data["hrtf"]
+        masks = batch_data["mask"]
+        sample_id = batch_data["id"].item()
+
+        # Use the generator model to generate fake samples
+        with torch.no_grad():
+            recon = model(lr_coefficient)
+
+        original_mask = masks[0].numpy().astype(bool)
+        SHT = SphericalHarmonicsTransform(max_degree, ds.row_angles, ds.column_angles, ds.radii, original_mask)
+        harmonics = torch.from_numpy(SHT.get_harmonics()).float().to(device)
+        if config.transform_flag:
+            recon = recon * std + mean
+
+        recon_hrtf = (harmonics @ recon[0].T).detach().cpu()
+        total_positions = len(recon_hrtf)
+        ori_hrtf = hrtf[0].reshape(nbins, -1).T.detach().cpu()
+        total_all_positions = 0
+        sr = recon_hrtf.reshape(-1, num_row_angles, num_col_angles, num_radii, nbins)
+        if config.domain == "magnitude":
+            sr = F.relu(sr) + margin
+
+        total_sd_metric = 0
+
+        ir_id = 0
+        max_value = None
+        max_id = None
+        min_value = None
+        min_id = None
+        print("subject: ", sample_id)
+        for ori, gen in zip(ori_hrtf, recon_hrtf):
+            if domain == 'magnitude_db':
+                ori = 10 ** (ori/20)
+                gen = 10 ** (gen/20)
+
+            if domain == 'magnitude_db' or domain == 'magnitude':
+                average_over_frequencies = spectral_distortion_inner(abs(gen), abs(ori))
+                total_all_positions += np.sqrt(average_over_frequencies)
+            elif domain == 'time':
+
+                nbins = 128
+                ori_tf_left = abs(scipy.fft.rfft(ori[:nbins], nbins*2)[1:])
+                ori_tf_right = abs(scipy.fft.rfft(ori[nbins:], nbins*2)[1:])
+                gen_tf_left = abs(scipy.fft.rfft(gen[:nbins], nbins*2)[1:])
+                gen_tf_right = abs(scipy.fft.rfft(gen[nbins:], nbins*2)[1:])
+
+                ori_tf = np.ma.concatenate([ori_tf_left, ori_tf_right])
+                gen_tf = np.ma.concatenate([gen_tf_left, gen_tf_right])
+
+                average_over_frequencies = spectral_distortion_inner(gen_tf, ori_tf)
+                total_all_positions += np.sqrt(average_over_frequencies)
+
+            # print('Log SD (for %s position): %s' % (ir_id, np.sqrt(average_over_frequencies)))
+            if max_value is None or np.sqrt(average_over_frequencies) > max_value:
+                max_value = np.sqrt(average_over_frequencies)
+                max_id = ir_id
+            if min_value is None or np.sqrt(average_over_frequencies) < min_value:
+                min_value = np.sqrt(average_over_frequencies)
+                min_id = ir_id
+            ir_id += 1
+
+        sd_metric = total_all_positions / total_positions
+        total_sd_metric += sd_metric
+        avg_lsd.append(sd_metric)
+
+        if plot_flag:
+            plot_tf(min_id, ori_hrtf, recon_hrtf)
+            plot_tf(max_id, ori_hrtf, recon_hrtf)
+            plot_flag = False
+
+        print('Log SD (across all positions): %s' % float(sd_metric))
+
+        file_name = '/' + f"{config.dataset}_{sample_id}.pickle"
+        sr = sr[0]
+
+        with open(recon_db_dir + file_name, "wb") as file:
+            pickle.dump(sr, file)
+
+        with open(recon_mag_dir + file_name, "wb") as file:
+            sr = 10 ** (sr / 20)
+            pickle.dump(sr, file)
+
+        # Preload the next batch of data
+        batch_data = val_prefetcher.next()
+
+    print("lsd for all test subject: ", avg_lsd)
+    mean_lsd = np.mean(avg_lsd)
+    print("avg lsd: ", mean_lsd)
