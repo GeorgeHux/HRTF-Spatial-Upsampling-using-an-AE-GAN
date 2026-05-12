@@ -1,4 +1,4 @@
-# HRTF Spatial Upsampling using an AE-GAN with a Comprehensive Evaluation Framework
+# Head-Related Transfer Function Upsampling Using an Autoencoder-Based Generative Adversarial Network with Evaluation Framework
 
 This repository provides the official implementation of our work on spatial upsampling of Head-Related Transfer Functions (HRTFs) using an Autoencoder-based Generative Adversarial Network (AE-GAN). The framework includes full support for preprocessing, model training, evaluation with perceptual and spectral metrics, and comparison with baseline methods such as Barycentric interpolation and HRTF selection.
 
