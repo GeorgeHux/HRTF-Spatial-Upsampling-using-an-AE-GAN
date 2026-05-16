@@ -69,7 +69,7 @@ def run_lsd_evaluation(config, sr_dir, file_ext=None, hrtf_selection=None):
         lsd_errors = []
         for file_name in val_data_file_names:
             target, generated = replace_nodes(config, sr_dir, file_name)
-            error = spectral_distortion_metric_vertical(generated, target)
+            error = spectral_distortion_metric(generated, target)
             subject_id = ''.join(re.findall(r'\d+', file_name))
             lsd_errors.append([subject_id, float(error.detach())])
             print('LSD Error of subject %s: %0.4f' % (subject_id, float(error.detach())))
